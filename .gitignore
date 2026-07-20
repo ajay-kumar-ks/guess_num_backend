@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Environment Variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Type Checking
+.mypy_cache/
+.pyre/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Alembic
+alembic/versions/__pycache__/
+
+# SQLite
+*.db
+*.sqlite3
+
+# PyInstaller
+*.spec
+
+# Cache
+.cache/
+
+# Node (if frontend exists later)
+node_modules/
+
+# Vercel
+.vercel/
+
+# Misc
+*.swp
+*.swo

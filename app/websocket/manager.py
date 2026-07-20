@@ -1,0 +1,204 @@
+import json
+import logging
+from typing import Dict, Set, Optional
+from fastapi import WebSocket
+
+from app.services.game_service import GameService
+from app.database.session import async_session
+
+logger = logging.getLogger(__name__)
+
+
+class ConnectionManager:
+    """
+    Manages WebSocket connections per room.
+    Each room has a dict of player_id -> WebSocket.
+    """
+
+    def __init__(self):
+        # rooms: room_code -> {player_id: websocket}
+        self.rooms: Dict[str, Dict[str, WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, room_code: str, player_id: str):
+        await websocket.accept()
+        if room_code not in self.rooms:
+            self.rooms[room_code] = {}
+        self.rooms[room_code][player_id] = websocket
+        logger.info(f"Player {player_id} connected to room {room_code}")
+
+        # Look up the connecting player's name
+        player_name = await self._get_player_name(room_code, player_id)
+
+        # Look up existing opponent in the room (if any)
+        opponent_name = await self._get_opponent_name(room_code, player_id)
+
+        # Send room_joined event with existing opponent info
+        await self.send_personal(
+            websocket,
+            {
+                "type": "room_joined",
+                "room_code": room_code,
+                "player_id": player_id,
+                "opponent_name": opponent_name,
+            },
+        )
+
+        # Notify existing players about the new player
+        await self.broadcast(
+            room_code,
+            {
+                "type": "opponent_joined",
+                "player_id": player_id,
+                "name": player_name or "Unknown",
+            },
+            exclude=player_id,
+        )
+
+    async def disconnect(self, websocket: WebSocket, room_code: str, player_id: str):
+        if room_code in self.rooms:
+            if player_id in self.rooms[room_code]:
+                del self.rooms[room_code][player_id]
+                logger.info(f"Player {player_id} disconnected from room {room_code}")
+
+                # Notify remaining players
+                await self.broadcast(
+                    room_code,
+                    {
+                        "type": "opponent_disconnected",
+                        "player_id": player_id,
+                    },
+                )
+
+                # Clean up empty rooms
+                if not self.rooms[room_code]:
+                    del self.rooms[room_code]
+
+    async def broadcast(self, room_code: str, message: dict, exclude: Optional[str] = None):
+        """Send a message to all players in a room, optionally excluding one."""
+        if room_code not in self.rooms:
+            return
+
+        disconnected = []
+        for pid, ws in self.rooms[room_code].items():
+            if pid == exclude:
+                continue
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.error(f"Failed to send to player {pid}: {e}")
+                disconnected.append(pid)
+
+        # Clean up disconnected players
+        for pid in disconnected:
+            del self.rooms[room_code][pid]
+
+    async def send_personal(self, websocket: WebSocket, message: dict):
+        """Send a message to a specific player."""
+        try:
+            await websocket.send_json(message)
+        except Exception as e:
+            logger.error(f"Failed to send personal message: {e}")
+
+    async def handle_guess(
+        self, room_code: str, player_id: str, guess: str
+    ):
+        """Process a guess via WebSocket and broadcast result."""
+        async with async_session() as db:
+            try:
+                result = await GameService.make_guess(db, room_code, player_id, guess)
+                await db.commit()
+
+                # Broadcast the guess result
+                guess_message = {
+                    "type": "guess_result",
+                    "guess_id": result.guess_id,
+                    "guess": result.guess,
+                    "position_count": result.position_count,
+                    "number_count": result.number_count,
+                    "player_id": result.player_id,
+                }
+                await self.broadcast(room_code, guess_message)
+
+                # Broadcast turn change with new current turn
+                game_state = await GameService.get_game_state(db, room_code)
+                turn_message = {
+                    "type": "turn_changed",
+                    "player_id": game_state.current_turn,
+                }
+                await self.broadcast(room_code, turn_message)
+
+                # If game over, broadcast winner
+                if result.game_over:
+                    winner_message = {
+                        "type": "winner",
+                        "winner_id": result.winner_id,
+                        "winner_name": await self._get_player_name(
+                            room_code, result.winner_id
+                        ),
+                    }
+                    await self.broadcast(room_code, winner_message)
+
+            except ValueError as e:
+                # Send error message back to the player who guessed
+                error_message = {
+                    "type": "error",
+                    "message": str(e),
+                }
+                if player_id in self.rooms.get(room_code, {}):
+                    await self.send_personal(
+                        self.rooms[room_code][player_id], error_message
+                    )
+
+    async def _get_player_name(self, room_code: str, player_id: str) -> Optional[str]:
+        """Get a player's name from the database."""
+        from app.models.player import Player
+        from sqlalchemy import select
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(Player.name).where(Player.id == player_id)
+            )
+            row = result.scalar_one_or_none()
+            return row if row else None
+
+    async def _get_opponent_name(self, room_code: str, my_player_id: str) -> Optional[str]:
+        """Get the name of the other player in the room (if any)."""
+        from app.models.player import Player
+        from app.models.game import Game
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(Game).options(selectinload(Game.players)).where(Game.room_code == room_code)
+            )
+            game = result.scalar_one_or_none()
+            if game:
+                for p in game.players:
+                    if p.id != my_player_id:
+                        return p.name
+            return None
+
+    async def handle_ready(self, room_code: str, player_id: str):
+        """Handle player_ready event - check if game should start."""
+        async with async_session() as db:
+            try:
+                game_state = await GameService.get_game_state(db, room_code)
+
+                # Both players joined and at least one has submitted
+                players = game_state.players
+                if len(players) == 2:
+                    # Notify both players that the game is starting
+                    await self.broadcast(
+                        room_code,
+                        {
+                            "type": "game_started",
+                            "current_turn": game_state.current_turn,
+                        },
+                    )
+            except Exception as e:
+                logger.error(f"Error handling ready: {e}")
+
+
+# Singleton instance
+manager = ConnectionManager()
