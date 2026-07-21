@@ -18,6 +18,8 @@ class ConnectionManager:
     def __init__(self):
         # rooms: room_code -> {player_id: websocket}
         self.rooms: Dict[str, Dict[str, WebSocket]] = {}
+        # Cache player names to reduce DB queries on Vercel (in-memory is fine per-instance)
+        self._player_name_cache: Dict[str, str] = {}
 
     async def connect(self, websocket: WebSocket, room_code: str, player_id: str):
         await websocket.accept()
@@ -26,13 +28,26 @@ class ConnectionManager:
         self.rooms[room_code][player_id] = websocket
         logger.info(f"Player {player_id} connected to room {room_code}")
 
-        # Look up the connecting player's name
+        # Look up the connecting player's name (with caching)
         player_name = await self._get_player_name(room_code, player_id)
+        if player_name:
+            self._player_name_cache[player_id] = player_name
 
         # Look up existing opponent in the room (if any)
         opponent_name = await self._get_opponent_name(room_code, player_id)
 
-        # Send room_joined event with existing opponent info
+        # Look up current game state to sync reconnecting players
+        game_status = None
+        current_turn = None
+        try:
+            async with async_session() as db:
+                game_state = await GameService.get_game_state(db, room_code)
+                game_status = game_state.status
+                current_turn = game_state.current_turn
+        except Exception as e:
+            logger.warning(f"Could not get game state for {room_code}: {e}")
+
+        # Send room_joined event with full game state (critical for reconnection)
         await self.send_personal(
             websocket,
             {
@@ -40,6 +55,8 @@ class ConnectionManager:
                 "room_code": room_code,
                 "player_id": player_id,
                 "opponent_name": opponent_name,
+                "game_status": game_status,
+                "current_turn": current_turn,
             },
         )
 
@@ -150,7 +167,11 @@ class ConnectionManager:
                     )
 
     async def _get_player_name(self, room_code: str, player_id: str) -> Optional[str]:
-        """Get a player's name from the database."""
+        """Get a player's name from the database (with in-memory cache)."""
+        # Check cache first to avoid DB query on every heartbeat/event
+        if player_id in self._player_name_cache:
+            return self._player_name_cache[player_id]
+
         from app.models.player import Player
         from sqlalchemy import select
 
@@ -159,7 +180,10 @@ class ConnectionManager:
                 select(Player.name).where(Player.id == player_id)
             )
             row = result.scalar_one_or_none()
-            return row if row else None
+            name = row if row else None
+            if name:
+                self._player_name_cache[player_id] = name
+            return name
 
     async def _get_opponent_name(self, room_code: str, my_player_id: str) -> Optional[str]:
         """Get the name of the other player in the room (if any)."""
