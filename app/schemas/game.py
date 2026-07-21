@@ -103,6 +103,19 @@ class HistoryResponse(BaseModel):
     guesses: List[GuessHistoryItem]
 
 
+class GameSecrets(BaseModel):
+    player_id: str
+    player_name: str
+    secret_number: Optional[str] = None
+
+
+class GameResultResponse(BaseModel):
+    winner_id: Optional[str] = None
+    winner_name: Optional[str] = None
+    game_over: bool = False
+    secrets: List[GameSecrets] = []
+
+
 class WinnerResponse(BaseModel):
     winner_id: Optional[str] = None
     winner_name: Optional[str] = None

@@ -20,6 +20,7 @@ from app.schemas.game import (
     GameStateResponse,
     HistoryResponse,
     WinnerResponse,
+    GameResultResponse,
 )
 
 router = APIRouter(tags=["Game"])
@@ -107,12 +108,23 @@ async def guess(request: GuessRequest, db: AsyncSession = Depends(get_db)):
                 winner_name = await manager._get_player_name(
                     request.room_code, result.winner_id
                 )
+                # Fetch secrets for the broadcast
+                secrets = []
+                try:
+                    game_result = await GameService.get_game_result(db, request.room_code)
+                    secrets = [
+                        {"player_id": s.player_id, "player_name": s.player_name, "secret_number": s.secret_number}
+                        for s in game_result.secrets
+                    ]
+                except Exception as e:
+                    logger.error(f"Failed to fetch game secrets for broadcast: {e}")
                 await manager.broadcast(
                     request.room_code,
                     {
                         "type": "winner",
                         "winner_id": result.winner_id,
                         "winner_name": winner_name,
+                        "secrets": secrets,
                     },
                 )
         except Exception as broadcast_err:
@@ -198,6 +210,19 @@ async def game_state(room_code: str, db: AsyncSession = Depends(get_db)):
 async def history(room_code: str, player_id: str = None, db: AsyncSession = Depends(get_db)):
     try:
         result = await GameService.get_history(db, room_code, player_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/game-result", response_model=GameResultResponse)
+async def game_result(room_code: str, db: AsyncSession = Depends(get_db)):
+    """Get game result including both players' secret numbers (only reveals when game is finished)."""
+    try:
+        result = await GameService.get_game_result(db, room_code)
+        if not result.game_over:
+            # Don't reveal secrets if game isn't over
+            result.secrets = []
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

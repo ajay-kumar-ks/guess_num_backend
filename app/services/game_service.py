@@ -18,6 +18,8 @@ from app.schemas.game import (
     GuessHistoryItem,
     HistoryResponse,
     WinnerResponse,
+    GameResultResponse,
+    GameSecrets,
 )
 
 
@@ -298,6 +300,50 @@ class GameService:
         ]
 
         return HistoryResponse(guesses=guess_items)
+
+    @staticmethod
+    async def get_game_result(
+        db: AsyncSession, room_code: str
+    ) -> GameResultResponse:
+        """Get game result including both players' secret numbers (only when game is finished)."""
+        game = await db.execute(
+            select(Game)
+            .options(selectinload(Game.players))
+            .where(Game.room_code == room_code)
+        )
+        game = game.scalar_one_or_none()
+
+        if not game:
+            raise ValueError("Room not found")
+
+        game_over = game.status == GameStatus.FINISHED
+
+        winner_name = None
+        if game.winner_id:
+            winner = next(
+                (p for p in game.players if p.id == game.winner_id), None
+            )
+            if winner:
+                winner_name = winner.name
+
+        # Only reveal secrets when game is actually finished
+        secrets = []
+        if game_over:
+            secrets = [
+                GameSecrets(
+                    player_id=p.id,
+                    player_name=p.name,
+                    secret_number=p.secret_number,
+                )
+                for p in game.players
+            ]
+
+        return GameResultResponse(
+            winner_id=game.winner_id,
+            winner_name=winner_name,
+            game_over=game_over,
+            secrets=secrets,
+        )
 
     @staticmethod
     async def get_winner(

@@ -149,14 +149,27 @@ class ConnectionManager:
                 }
                 await self.broadcast(room_code, turn_message)
 
-                # If game over, broadcast winner
+                # If game over, broadcast winner with secret numbers
                 if result.game_over:
+                    # Fetch both players' secrets
+                    secrets = []
+                    try:
+                        async with async_session() as db2:
+                            game_result = await GameService.get_game_result(db2, room_code)
+                            secrets = [
+                                {"player_id": s.player_id, "player_name": s.player_name, "secret_number": s.secret_number}
+                                for s in game_result.secrets
+                            ]
+                    except Exception as e:
+                        logger.error(f"Failed to fetch game secrets: {e}")
+
                     winner_message = {
                         "type": "winner",
                         "winner_id": result.winner_id,
                         "winner_name": await self._get_player_name(
                             room_code, result.winner_id
                         ),
+                        "secrets": secrets,
                     }
                     await self.broadcast(room_code, winner_message)
 
