@@ -82,6 +82,43 @@ async def guess(request: GuessRequest, db: AsyncSession = Depends(get_db)):
         result = await GameService.make_guess(
             db, request.room_code, request.player_id, request.guess
         )
+        # Broadcast guess result and turn change via WebSocket (for opponent and spectators)
+        try:
+            guess_message = {
+                "type": "guess_result",
+                "guess_id": result.guess_id,
+                "guess": result.guess,
+                "position_count": result.position_count,
+                "number_count": result.number_count,
+                "player_id": result.player_id,
+            }
+            await manager.broadcast(request.room_code, guess_message)
+
+            turn_message = {
+                "type": "turn_changed",
+                "player_id": result.player_id if result.game_over else None,
+            }
+            # Get the actual current turn from DB
+            game_state = await GameService.get_game_state(db, request.room_code)
+            turn_message["player_id"] = game_state.current_turn
+            await manager.broadcast(request.room_code, turn_message)
+
+            if result.game_over:
+                winner_name = await manager._get_player_name(
+                    request.room_code, result.winner_id
+                )
+                await manager.broadcast(
+                    request.room_code,
+                    {
+                        "type": "winner",
+                        "winner_id": result.winner_id,
+                        "winner_name": winner_name,
+                    },
+                )
+        except Exception as broadcast_err:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to broadcast guess result: {broadcast_err}")
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
