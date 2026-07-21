@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db
 from app.services.game_service import GameService
+from app.websocket.manager import manager
 from app.schemas.game import (
     CreateRoomRequest,
     CreateRoomResponse,
@@ -44,6 +45,28 @@ async def submit_secret(request: SubmitSecretRequest, db: AsyncSession = Depends
         result = await GameService.submit_secret(
             db, request.room_code, request.player_id, request.secret_number
         )
+        # When both players have submitted, broadcast the game start via WebSocket
+        if result.both_submitted and result.current_turn:
+            try:
+                await manager.broadcast(
+                    request.room_code,
+                    {
+                        "type": "game_started",
+                        "current_turn": result.current_turn,
+                    },
+                )
+                await manager.broadcast(
+                    request.room_code,
+                    {
+                        "type": "turn_changed",
+                        "player_id": result.current_turn,
+                    },
+                )
+            except Exception as broadcast_err:
+                # Log but don't fail the request - DB commit is more important
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to broadcast game start: {broadcast_err}")
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

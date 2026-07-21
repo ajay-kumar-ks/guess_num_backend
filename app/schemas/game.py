@@ -46,6 +46,7 @@ class SubmitSecretRequest(BaseModel):
 class SubmitSecretResponse(BaseModel):
     message: str
     both_submitted: bool = False
+    current_turn: Optional[str] = None
 
 
 class GuessRequest(BaseModel):

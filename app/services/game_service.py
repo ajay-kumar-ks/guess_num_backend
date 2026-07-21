@@ -149,15 +149,18 @@ class GameService:
         # Check if both players have submitted
         both_submitted = all(p.secret_number is not None for p in game.players)
 
+        current_turn = None
         if both_submitted:
             game.status = GameStatus.PLAYING
             # Set current turn to the player who joined first
             sorted_players = sorted(game.players, key=lambda p: p.joined_at)
             game.current_turn = sorted_players[0].id
+            current_turn = game.current_turn
 
         return SubmitSecretResponse(
             message="Secret number submitted",
             both_submitted=both_submitted,
+            current_turn=current_turn,
         )
 
     @staticmethod
