@@ -93,3 +93,37 @@ async def websocket_endpoint(websocket: WebSocket, room_code: str, player_id: st
         logger.error(f"WebSocket error for player {player_id}: {e}")
     finally:
         await manager.disconnect(websocket, room_code, player_id)
+
+
+@app.websocket("/ws/spectate/{room_code}")
+async def websocket_spectate(websocket: WebSocket, room_code: str):
+    """
+    WebSocket endpoint for spectators.
+    Spectators can watch the game in real-time but cannot make guesses.
+    """
+    await manager.connect_spectator(websocket, room_code)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                await manager.send_personal(
+                    websocket, {"type": "error", "message": "Invalid JSON"}
+                )
+                continue
+
+            msg_type = message.get("type")
+
+            if msg_type == "heartbeat":
+                await manager.send_personal(
+                    websocket, {"type": "heartbeat_ack"}
+                )
+            # Spectators only get heartbeats - no game interactions
+
+    except WebSocketDisconnect:
+        logger.info(f"Spectator WebSocket disconnected from room {room_code}")
+    except Exception as e:
+        logger.error(f"Spectator WebSocket error for room {room_code}: {e}")
+    finally:
+        manager._disconnect_spectator(websocket, room_code)

@@ -1,9 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.database.session import get_db
 from app.services.game_service import GameService
 from app.websocket.manager import manager
+from app.models.game import Game
+from app.models.guess import Guess
 from app.schemas.game import (
     CreateRoomRequest,
     CreateRoomResponse,
@@ -81,6 +85,67 @@ async def guess(request: GuessRequest, db: AsyncSession = Depends(get_db)):
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/spectate/game-state")
+async def spectate_game_state(room_code: str, db: AsyncSession = Depends(get_db)):
+    """
+    Get spectator-friendly game state (no secret numbers exposed).
+    Returns player info, game status, and guess history.
+    """
+    try:
+        game = await db.execute(
+            select(Game)
+            .options(selectinload(Game.players))
+            .where(Game.room_code == room_code)
+        )
+        game = game.scalar_one_or_none()
+        if not game:
+            raise HTTPException(status_code=404, detail="Room not found")
+
+        # Get guess history
+        guess_query = (
+            select(Guess)
+            .where(Guess.game_id == game.id)
+            .order_by(Guess.created_at.asc())
+        )
+        guess_result = await db.execute(guess_query)
+        guesses = guess_result.scalars().all()
+
+        from app.schemas.game import PlayerInfo, GuessHistoryItem
+
+        players = [
+            PlayerInfo(
+                id=p.id,
+                name=p.name,
+                has_submitted_secret=p.secret_number is not None,
+            )
+            for p in game.players
+        ]
+
+        guess_items = [
+            GuessHistoryItem(
+                guess=g.guess,
+                position_count=g.position_count,
+                number_count=g.number_count,
+                player_id=g.player_id,
+                created_at=g.created_at,
+            )
+            for g in guesses
+        ]
+
+        return {
+            "room_code": game.room_code,
+            "status": game.status,
+            "players": [p.model_dump() for p in players],
+            "current_turn": game.current_turn,
+            "winner_id": game.winner_id,
+            "guesses": [g.model_dump(mode="json") for g in guess_items],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/game-state", response_model=GameStateResponse)

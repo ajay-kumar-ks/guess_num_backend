@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Dict, Set, Optional
+from typing import Dict, List, Set, Optional
 from fastapi import WebSocket
 
 from app.services.game_service import GameService
@@ -18,6 +18,8 @@ class ConnectionManager:
     def __init__(self):
         # rooms: room_code -> {player_id: websocket}
         self.rooms: Dict[str, Dict[str, WebSocket]] = {}
+        # spectators: room_code -> [websocket, ...]
+        self.spectators: Dict[str, List[WebSocket]] = {}
         # Cache player names to reduce DB queries on Vercel (in-memory is fine per-instance)
         self._player_name_cache: Dict[str, str] = {}
 
@@ -72,12 +74,13 @@ class ConnectionManager:
         )
 
     async def disconnect(self, websocket: WebSocket, room_code: str, player_id: str):
+        self._disconnect_spectator(websocket, room_code)
         if room_code in self.rooms:
             if player_id in self.rooms[room_code]:
                 del self.rooms[room_code][player_id]
                 logger.info(f"Player {player_id} disconnected from room {room_code}")
 
-                # Notify remaining players
+                # Notify remaining players and spectators
                 await self.broadcast(
                     room_code,
                     {
@@ -91,23 +94,25 @@ class ConnectionManager:
                     del self.rooms[room_code]
 
     async def broadcast(self, room_code: str, message: dict, exclude: Optional[str] = None):
-        """Send a message to all players in a room, optionally excluding one."""
-        if room_code not in self.rooms:
-            return
+        """Send a message to all players AND spectators in a room, optionally excluding one player."""
+        # Send to players
+        if room_code in self.rooms:
+            disconnected = []
+            for pid, ws in self.rooms[room_code].items():
+                if pid == exclude:
+                    continue
+                try:
+                    await ws.send_json(message)
+                except Exception as e:
+                    logger.error(f"Failed to send to player {pid}: {e}")
+                    disconnected.append(pid)
 
-        disconnected = []
-        for pid, ws in self.rooms[room_code].items():
-            if pid == exclude:
-                continue
-            try:
-                await ws.send_json(message)
-            except Exception as e:
-                logger.error(f"Failed to send to player {pid}: {e}")
-                disconnected.append(pid)
+            # Clean up disconnected players
+            for pid in disconnected:
+                del self.rooms[room_code][pid]
 
-        # Clean up disconnected players
-        for pid in disconnected:
-            del self.rooms[room_code][pid]
+        # Also send to spectators (they get all events)
+        await self._broadcast_to_spectators(room_code, message)
 
     async def send_personal(self, websocket: WebSocket, message: dict):
         """Send a message to a specific player."""
@@ -222,6 +227,74 @@ class ConnectionManager:
                     )
             except Exception as e:
                 logger.error(f"Error handling ready: {e}")
+
+    async def connect_spectator(self, websocket: WebSocket, room_code: str):
+        """Connect a spectator to a room. They receive all broadcasts but can't interact."""
+        await websocket.accept()
+        if room_code not in self.spectators:
+            self.spectators[room_code] = []
+        self.spectators[room_code].append(websocket)
+        logger.info(f"Spectator connected to room {room_code}")
+
+        # Send initial game state to the spectator
+        try:
+            async with async_session() as db:
+                game_state = await GameService.get_game_state(db, room_code)
+                await self.send_personal(
+                    websocket,
+                    {
+                        "type": "spectate_joined",
+                        "room_code": room_code,
+                        "game_status": game_state.status,
+                        "players": [
+                            {"id": p.id, "name": p.name, "has_submitted_secret": p.has_submitted_secret}
+                            for p in game_state.players
+                        ],
+                        "current_turn": game_state.current_turn,
+                        "winner_id": game_state.winner_id,
+                    },
+                )
+        except Exception as e:
+            logger.warning(f"Could not get initial game state for spectator: {e}")
+            await self.send_personal(
+                websocket,
+                {
+                    "type": "spectate_joined",
+                    "room_code": room_code,
+                    "game_status": None,
+                    "players": [],
+                    "current_turn": None,
+                    "winner_id": None,
+                },
+            )
+
+    def _disconnect_spectator(self, websocket: WebSocket, room_code: str):
+        """Remove a spectator from the room."""
+        if room_code in self.spectators:
+            if websocket in self.spectators[room_code]:
+                self.spectators[room_code].remove(websocket)
+                logger.info(f"Spectator disconnected from room {room_code}")
+            if not self.spectators[room_code]:
+                del self.spectators[room_code]
+
+    async def _broadcast_to_spectators(self, room_code: str, message: dict):
+        """Send a message to all spectators in a room."""
+        if room_code not in self.spectators:
+            return
+
+        disconnected = []
+        for ws in self.spectators[room_code]:
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.error(f"Failed to send to spectator: {e}")
+                disconnected.append(ws)
+
+        # Clean up disconnected spectators
+        for ws in disconnected:
+            self.spectators[room_code].remove(ws)
+        if room_code in self.spectators and not self.spectators[room_code]:
+            del self.spectators[room_code]
 
 
 # Singleton instance
