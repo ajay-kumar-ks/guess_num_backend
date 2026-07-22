@@ -95,14 +95,15 @@ async def guess(request: GuessRequest, db: AsyncSession = Depends(get_db)):
             }
             await manager.broadcast(request.room_code, guess_message)
 
-            turn_message = {
-                "type": "turn_changed",
-                "player_id": result.player_id if result.game_over else None,
-            }
-            # Get the actual current turn from DB
-            game_state = await GameService.get_game_state(db, request.room_code)
-            turn_message["player_id"] = game_state.current_turn
-            await manager.broadcast(request.room_code, turn_message)
+            # Only send turn_changed if game is not over
+            if not result.game_over:
+                # Get the actual current turn from DB (opponent's turn now)
+                game_state = await GameService.get_game_state(db, request.room_code)
+                turn_message = {
+                    "type": "turn_changed",
+                    "player_id": game_state.current_turn,
+                }
+                await manager.broadcast(request.room_code, turn_message)
 
             if result.game_over:
                 winner_name = await manager._get_player_name(
@@ -235,3 +236,34 @@ async def winner(room_code: str, db: AsyncSession = Depends(get_db)):
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/game-sync")
+async def game_sync(room_code: str, db: AsyncSession = Depends(get_db)):
+    """
+    CRITICAL: Full game state sync endpoint for reconnection/refresh scenarios.
+    Returns ALL game data needed to restore UI state: game state, all guesses, and winner info.
+    Used when player refreshes the page or reconnects after WebSocket drop.
+    """
+    try:
+        # Get game state
+        game_state = await GameService.get_game_state(db, room_code)
+        
+        # Get full guess history
+        history = await GameService.get_history(db, room_code, None)
+        
+        # Get game result (includes secrets if game is finished)
+        game_result = await GameService.get_game_result(db, room_code)
+        
+        return {
+            "game_state": game_state.model_dump(),
+            "guesses": [g.model_dump(mode="json") for g in history.guesses],
+            "winner": game_result.model_dump(),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error in game-sync endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Failed to sync game state")

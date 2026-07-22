@@ -141,13 +141,15 @@ class ConnectionManager:
                 }
                 await self.broadcast(room_code, guess_message)
 
-                # Broadcast turn change with new current turn
-                game_state = await GameService.get_game_state(db, room_code)
-                turn_message = {
-                    "type": "turn_changed",
-                    "player_id": game_state.current_turn,
-                }
-                await self.broadcast(room_code, turn_message)
+                # Only send turn change if game is not over
+                if not result.game_over:
+                    # Broadcast turn change with new current turn
+                    game_state = await GameService.get_game_state(db, room_code)
+                    turn_message = {
+                        "type": "turn_changed",
+                        "player_id": game_state.current_turn,
+                    }
+                    await self.broadcast(room_code, turn_message)
 
                 # If game over, broadcast winner with secret numbers
                 if result.game_over:

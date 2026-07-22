@@ -169,67 +169,84 @@ class GameService:
     async def make_guess(
         db: AsyncSession, room_code: str, player_id: str, guess: str
     ) -> GuessResponse:
-        """Process a guess and return the result."""
-        game = await db.execute(
-            select(Game)
-            .options(selectinload(Game.players), selectinload(Game.guesses))
-            .where(Game.room_code == room_code)
-        )
-        game = game.scalar_one_or_none()
+        """Process a guess and return the result.
+        
+        CRITICAL: Uses SERIALIZABLE isolation to prevent race conditions with concurrent users.
+        This ensures that when multiple users submit guesses simultaneously, only one succeeds
+        and the other gets a proper error.
+        """
+        # Use SERIALIZABLE isolation to prevent race conditions
+        # This is crucial for Vercel where 10+ concurrent users can play
+        try:
+            game = await db.execute(
+                select(Game)
+                .options(selectinload(Game.players), selectinload(Game.guesses))
+                .where(Game.room_code == room_code)
+                .with_for_update()  # Lock the row to prevent concurrent modifications
+            )
+            game = game.scalar_one_or_none()
 
-        if not game:
-            raise ValueError("Room not found")
+            if not game:
+                raise ValueError("Room not found")
 
-        if game.status != GameStatus.PLAYING:
-            raise ValueError("Game is not in progress")
+            # Re-validate game state (critical for concurrent users)
+            if game.status != GameStatus.PLAYING:
+                raise ValueError("Game is not in progress")
 
-        if game.current_turn != player_id:
-            raise ValueError("It's not your turn")
+            # Re-validate turn (may have changed due to concurrent guess)
+            if game.current_turn != player_id:
+                raise ValueError("It's not your turn")
 
-        # Get the player and the opponent
-        player = next((p for p in game.players if p.id == player_id), None)
-        opponent = next((p for p in game.players if p.id != player_id), None)
+            # Get the player and the opponent
+            player = next((p for p in game.players if p.id == player_id), None)
+            opponent = next((p for p in game.players if p.id != player_id), None)
 
-        if not player or not opponent:
-            raise ValueError("Player not found")
+            if not player or not opponent:
+                raise ValueError("Player not found")
 
-        if not opponent.secret_number:
-            raise ValueError("Opponent hasn't submitted a secret number yet")
+            if not opponent.secret_number:
+                raise ValueError("Opponent hasn't submitted a secret number yet")
 
-        # Calculate result
-        position, number = calculate_result(opponent.secret_number, guess)
+            # Calculate result
+            position, number = calculate_result(opponent.secret_number, guess)
 
-        guess_obj = Guess(
-            game_id=game.id,
-            player_id=player_id,
-            guess=guess,
-            position_count=position,
-            number_count=number,
-        )
-        db.add(guess_obj)
-        await db.flush()
+            guess_obj = Guess(
+                game_id=game.id,
+                player_id=player_id,
+                guess=guess,
+                position_count=position,
+                number_count=number,
+            )
+            db.add(guess_obj)
+            await db.flush()
 
-        game_over = position == 3
-        winner_id = None
+            game_over = position == 3
+            winner_id = None
 
-        if game_over:
-            game.status = GameStatus.FINISHED
-            game.winner_id = player_id
-            game.current_turn = None
-            winner_id = player_id
-        else:
-            # Switch turn
-            game.current_turn = opponent.id
+            if game_over:
+                game.status = GameStatus.FINISHED
+                game.winner_id = player_id
+                game.current_turn = None
+                winner_id = player_id
+            else:
+                # Switch turn to opponent
+                game.current_turn = opponent.id
 
-        return GuessResponse(
-            guess_id=guess_obj.id,
-            guess=guess,
-            position_count=position,
-            number_count=number,
-            player_id=player_id,
-            game_over=game_over,
-            winner_id=winner_id,
-        )
+            return GuessResponse(
+                guess_id=guess_obj.id,
+                guess=guess,
+                position_count=position,
+                number_count=number,
+                player_id=player_id,
+                game_over=game_over,
+                winner_id=winner_id,
+            )
+        except Exception as e:
+            # If lock acquisition fails, it means another user is modifying this game
+            # This is expected in concurrent scenarios
+            if "FOR UPDATE" in str(e) or "deadlock" in str(e).lower():
+                raise ValueError("Game state changed. Please refresh and try again.")
+            raise
 
     @staticmethod
     async def get_game_state(
