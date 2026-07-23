@@ -307,6 +307,7 @@ class GameService:
 
         guess_items = [
             GuessHistoryItem(
+                guess_id=g.id,
                 guess=g.guess,
                 position_count=g.position_count,
                 number_count=g.number_count,

@@ -78,6 +78,7 @@ class GuessResponse(BaseModel):
 
 
 class GuessHistoryItem(BaseModel):
+    guess_id: str
     guess: str
     position_count: int
     number_count: int
