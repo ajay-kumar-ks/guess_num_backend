@@ -1,13 +1,18 @@
 import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.api.health import router as health_router
 from app.api.game import router as game_router
+from app.database.session import Base, async_session, engine
+from app.models.access_log import AccessLog
 from app.websocket.manager import manager
 
 # Configure logging
@@ -19,11 +24,20 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # CORS middleware
@@ -38,6 +52,82 @@ app.add_middleware(
 # Include routers
 app.include_router(health_router)
 app.include_router(game_router)
+
+
+@app.middleware("http")
+async def log_access(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        try:
+            async with async_session() as session:
+                body = await request.body()
+                raw_body = body.decode("utf-8", errors="ignore") if body else ""
+                room_code = None
+                game_name = None
+                player_name = None
+
+                if request.url.path.startswith("/create-room"):
+                    game_name = "room-create"
+                elif request.url.path.startswith("/join-room"):
+                    game_name = "room-join"
+                elif request.url.path.startswith("/submit-secret"):
+                    game_name = "submit-secret"
+                elif request.url.path.startswith("/guess"):
+                    game_name = "guess"
+                elif request.url.path.startswith("/game-state") or request.url.path.startswith("/history"):
+                    game_name = "game-state"
+
+                if room_code is None:
+                    try:
+                        if "room_code" in request.query_params:
+                            room_code = request.query_params.get("room_code")
+                    except Exception:
+                        room_code = None
+
+                if game_name is None and room_code:
+                    game_name = f"room:{room_code}"
+
+                if raw_body:
+                    try:
+                        import json
+                        payload = json.loads(raw_body)
+                        if isinstance(payload, dict):
+                            if not room_code and isinstance(payload.get("room_code"), str):
+                                room_code = payload.get("room_code")
+                            if isinstance(payload.get("name"), str):
+                                player_name = payload.get("name")
+                            if isinstance(payload.get("player_name"), str):
+                                player_name = payload.get("player_name")
+                            if isinstance(payload.get("game_name"), str):
+                                game_name = payload.get("game_name")
+                    except Exception:
+                        pass
+
+                log_entry = AccessLog(
+                    id=str(uuid.uuid4()),
+                    created_at=datetime.now(timezone.utc),
+                    ip_address=request.client.host if request.client else None,
+                    method=request.method,
+                    path=request.url.path,
+                    user_agent=request.headers.get("user-agent"),
+                    referer=request.headers.get("referer"),
+                    status_code=response.status_code if response else None,
+                    response_time_ms=duration_ms,
+                    room_code=room_code,
+                    game_name=game_name,
+                    player_name=player_name,
+                    query_params=str(dict(request.query_params)),
+                    request_details=raw_body[:2000],
+                )
+                session.add(log_entry)
+                await session.commit()
+        except Exception as log_error:
+            logger.exception(f"Failed to persist access log: {log_error}")
 
 
 @app.get("/")
