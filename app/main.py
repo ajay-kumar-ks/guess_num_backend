@@ -66,8 +66,14 @@ async def log_access(request: Request, call_next):
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         try:
             async with async_session() as session:
-                body = await request.body()
-                raw_body = body.decode("utf-8", errors="ignore") if body else ""
+                # Body may be consumed by route handler or client may disconnect - handle gracefully
+                raw_body = ""
+                try:
+                    body = await request.body()
+                    raw_body = body.decode("utf-8", errors="ignore") if body else ""
+                except Exception:
+                    # Stream consumed by another handler, or client disconnected mid-request
+                    raw_body = ""
                 room_code = None
                 game_name = None
                 player_name = None
