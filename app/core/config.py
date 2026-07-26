@@ -1,8 +1,7 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
-import os
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -23,10 +22,16 @@ class Settings(BaseSettings):
 
     # CORS
     ALLOWED_ORIGINS: str = "http://localhost:5173,http://localhost:3000"
+    ALLOWED_ORIGIN_REGEX: Optional[str] = r"https://.*\.vercel\.app|http://localhost(:\d+)?"
 
     @property
     def cors_origins(self) -> List[str]:
-        return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",")]
+        return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def cors_origin_regex(self) -> Optional[str]:
+        cleaned = (self.ALLOWED_ORIGIN_REGEX or "").strip()
+        return cleaned or None
 
     class Config:
         env_file = Path(__file__).resolve().parent.parent.parent / ".env"
